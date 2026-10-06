@@ -1,0 +1,21 @@
+{
+    "author": "pmforster@gmail.com",
+    "dependencies": {},
+    "keywords": [],
+    "name": "typingmonkeysprint",
+    "pebble": {
+        "displayName": "TypingMonkeySprint",
+        "enableMultiJS": true,
+        "messageKeys": [],
+        "projectType": "native",
+        "resources": {
+            "media": []
+        },
+        "sdkVersion": "3",
+        "uuid": "2cc4911a-22c2-4159-b872-640325336ec4",
+        "watchapp": {
+            "watchface": false
+        }
+    },
+    "version": "1.0.0"
+}
