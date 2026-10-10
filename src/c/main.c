@@ -25,6 +25,7 @@ typedef enum {
   APP_STATE_PROJECT_HUB,
   APP_STATE_CREATE_NAME,
   APP_STATE_LOAD_LIST,
+  APP_STATE_CONFIRM_DELETE,
   APP_STATE_INPUT_COUNT,
   APP_STATE_CONFIRM_MENU,
   APP_STATE_INPUT_TIME,
@@ -77,8 +78,18 @@ static TextLayer *s_load_title_layer;
 static TextLayer *s_load_items_layers[3];
 static TextLayer *s_load_empty_layer;
 static TextLayer *s_load_back_layer;
+static TextLayer *s_load_hint_layer;
 static Layer *s_load_highlight_layer;
 static int s_load_selected_idx = 0;
+
+// --- Screen 3b: Delete Confirmation ---
+static TextLayer *s_del_title_layer;
+static TextLayer *s_del_target_layer;
+static TextLayer *s_del_opt1_layer;
+static TextLayer *s_del_opt2_layer;
+static Layer *s_del_highlight_layer;
+static int s_del_menu_idx = 1; // Default to Cancel for safety (0 = Delete, 1 = Cancel)
+static int s_del_target_idx = -1;
 
 // --- Screen 4 & 6: Word Count Input (Start/End) ---
 static TextLayer *s_count_title_layer;
@@ -120,7 +131,7 @@ static TextLayer *s_writing_layer;
 static Layer *s_monkey_anim_layer;
 static AppTimer *s_sprint_timer = NULL;
 static int s_seconds_remaining = 0;
-static int s_anim_frame = 0; // 0 to 3 repeating
+static int s_anim_frame = 0;
 
 // --- Screen 9: Results / Post-Sprint Summary ---
 static TextLayer *s_summary_stats_layer;
@@ -129,13 +140,17 @@ static TextLayer *s_summary_opt2_layer;
 static Layer *s_summary_highlight_layer;
 static int s_summary_menu_index = 0;
 
-static const uint32_t s_vibe_segments[] = { 350, 200, 350, 200, 350 };
-static const VibePattern s_triple_vibe = {
-  .durations = (uint32_t *)s_vibe_segments,
-  .num_segments = ARRAY_LENGTH(s_vibe_segments),
+// Doubled end-of-sprint vibration pattern
+static const uint32_t s_extended_vibe_segments[] = { 
+  700, 250, 700, 250, 700, 250, 700, 250, 700 
+};
+static const VibePattern s_sprint_end_vibes = {
+  .durations = (uint32_t *)s_extended_vibe_segments,
+  .num_segments = ARRAY_LENGTH(s_extended_vibe_segments),
 };
 
 static void set_app_state(AppState new_state);
+static void refresh_load_list(void);
 
 // --- Storage Handlers ---
 static void load_projects(void) {
@@ -163,10 +178,40 @@ static void save_projects(void) {
   persist_write_int(PERSIST_KEY_COUNT, s_num_projects);
   if (s_num_projects > 0) {
     persist_write_data(PERSIST_KEY_PROJECTS, s_projects, sizeof(Project) * s_num_projects);
+  } else {
+    persist_delete(PERSIST_KEY_PROJECTS);
   }
   if (s_last_sprinted_idx >= 0) {
     persist_write_int(PERSIST_KEY_LAST_PROJECT, s_last_sprinted_idx);
+  } else {
+    persist_delete(PERSIST_KEY_LAST_PROJECT);
   }
+}
+
+// --- Project Deletion Execution ---
+static void execute_delete_project(int index) {
+  if (index < 0 || index >= s_num_projects) return;
+
+  for (int i = index; i < s_num_projects - 1; i++) {
+    s_projects[i] = s_projects[i + 1];
+  }
+
+  memset(&s_projects[s_num_projects - 1], 0, sizeof(Project));
+  s_num_projects--;
+
+  if (s_last_sprinted_idx == index) {
+    s_last_sprinted_idx = (s_num_projects > 0) ? 0 : -1;
+  } else if (s_last_sprinted_idx > index) {
+    s_last_sprinted_idx--;
+  }
+
+  save_projects();
+
+  if (s_load_selected_idx >= s_num_projects && s_load_selected_idx > 0) {
+    s_load_selected_idx = s_num_projects - 1;
+  }
+
+  vibes_short_pulse();
 }
 
 // --- Bubble Text Renderer ---
@@ -206,34 +251,28 @@ static void monkey_anim_update_proc(Layer *layer, GContext *ctx) {
     int base_x = mid_x - 36;
     int base_y = 6;
 
-    // 1. Desk Surface
     graphics_context_set_stroke_color(ctx, COLOR_TEXT_MAIN);
     graphics_draw_line(ctx, GPoint(base_x - 12, base_y + 44), GPoint(base_x + 82, base_y + 44));
 
-    // 2. Typewriter (Body & Roller)
     graphics_context_set_fill_color(ctx, COLOR_ACCENT);
-    graphics_fill_rect(ctx, GRect(base_x + 40, base_y + 30, 26, 14), 2, GCornersAll); // body
+    graphics_fill_rect(ctx, GRect(base_x + 40, base_y + 30, 26, 14), 2, GCornersAll);
     graphics_context_set_fill_color(ctx, COLOR_TEXT_MAIN);
-    graphics_fill_rect(ctx, GRect(base_x + 45, base_y + 24, 16, 6), 1, GCornersAll);  // roller
+    graphics_fill_rect(ctx, GRect(base_x + 45, base_y + 24, 16, 6), 1, GCornersAll);
 
-    // 3. Paper Sheet (Jitters up/down between frames)
     int paper_offset = (s_anim_frame % 2 == 0) ? 0 : 3;
     graphics_context_set_fill_color(ctx, GColorWhite);
     graphics_fill_rect(ctx, GRect(base_x + 48, base_y + 12 + paper_offset, 10, 14), 0, GCornerNone);
 
-    // 4. Monkey Body (Side View)
     graphics_context_set_fill_color(ctx, COLOR_MONKEY);
-    graphics_fill_rect(ctx, GRect(base_x + 10, base_y + 20, 18, 22), 4, GCornersAll); // torso
-    graphics_fill_circle(ctx, GPoint(base_x + 19, base_y + 13), 9);                     // head
-    graphics_fill_circle(ctx, GPoint(base_x + 8, base_y + 12), 4);                      // left ear
+    graphics_fill_rect(ctx, GRect(base_x + 10, base_y + 20, 18, 22), 4, GCornersAll);
+    graphics_fill_circle(ctx, GPoint(base_x + 19, base_y + 13), 9);
+    graphics_fill_circle(ctx, GPoint(base_x + 8, base_y + 12), 4);
     graphics_context_set_fill_color(ctx, COLOR_ACCENT);
-    graphics_fill_circle(ctx, GPoint(base_x + 24, base_y + 15), 5);                     // muzzle
+    graphics_fill_circle(ctx, GPoint(base_x + 24, base_y + 15), 5);
 
-    // Eye
     graphics_context_set_fill_color(ctx, GColorBlack);
     graphics_fill_circle(ctx, GPoint(base_x + 22, base_y + 12), 2);
 
-    // 5. Monkey Tail (Wags across frames)
     graphics_context_set_stroke_color(ctx, COLOR_MONKEY);
     graphics_context_set_stroke_width(ctx, 2);
     if (s_anim_frame == 0 || s_anim_frame == 2) {
@@ -244,35 +283,30 @@ static void monkey_anim_update_proc(Layer *layer, GContext *ctx) {
       graphics_draw_line(ctx, GPoint(base_x - 4, base_y + 36), GPoint(base_x - 8, base_y + 28));
     }
 
-    // 6. Typing Hand / Arm (Strikes the keys)
     int hand_y = (s_anim_frame == 1 || s_anim_frame == 3) ? (base_y + 31) : (base_y + 23);
     graphics_draw_line(ctx, GPoint(base_x + 20, base_y + 24), GPoint(base_x + 35, hand_y));
     graphics_context_set_fill_color(ctx, COLOR_ACCENT);
-    graphics_fill_circle(ctx, GPoint(base_x + 36, hand_y), 3); // hand paws keys
+    graphics_fill_circle(ctx, GPoint(base_x + 36, hand_y), 3);
 
   } else if (s_app_state == APP_STATE_FINISHED) {
-    // Monkey Thumbs Up Celebration
     int cx = mid_x;
     int cy = 26;
 
-    // Body & Head
     graphics_context_set_fill_color(ctx, COLOR_MONKEY);
-    graphics_fill_circle(ctx, GPoint(cx, cy), 12);               // Head
-    graphics_fill_circle(ctx, GPoint(cx - 13, cy - 2), 5);        // Left ear
-    graphics_fill_circle(ctx, GPoint(cx + 13, cy - 2), 5);        // Right ear
+    graphics_fill_circle(ctx, GPoint(cx, cy), 12);
+    graphics_fill_circle(ctx, GPoint(cx - 13, cy - 2), 5);
+    graphics_fill_circle(ctx, GPoint(cx + 13, cy - 2), 5);
     graphics_context_set_fill_color(ctx, COLOR_ACCENT);
-    graphics_fill_circle(ctx, GPoint(cx, cy + 4), 6);            // Snout
+    graphics_fill_circle(ctx, GPoint(cx, cy + 4), 6);
 
-    // Smile Eyes
     graphics_context_set_stroke_color(ctx, GColorBlack);
     graphics_context_set_stroke_width(ctx, 2);
     graphics_draw_line(ctx, GPoint(cx - 5, cy - 1), GPoint(cx - 2, cy - 1));
     graphics_draw_line(ctx, GPoint(cx + 2, cy - 1), GPoint(cx + 5, cy - 1));
 
-    // Thumbs-Up Hand
     graphics_context_set_fill_color(ctx, COLOR_ACCENT);
-    graphics_fill_rect(ctx, GRect(cx + 16, cy - 2, 7, 10), 2, GCornersAll); // fist
-    graphics_fill_rect(ctx, GRect(cx + 18, cy - 8, 4, 8), 1, GCornersAll);  // thumb pointing up
+    graphics_fill_rect(ctx, GRect(cx + 16, cy - 2, 7, 10), 2, GCornersAll);
+    graphics_fill_rect(ctx, GRect(cx + 18, cy - 8, 4, 8), 1, GCornersAll);
   }
 }
 
@@ -395,6 +429,7 @@ static void refresh_load_list(void) {
   if (s_num_projects == 0) {
     layer_set_hidden(text_layer_get_layer(s_load_empty_layer), false);
     layer_set_hidden(text_layer_get_layer(s_load_back_layer), false);
+    layer_set_hidden(text_layer_get_layer(s_load_hint_layer), true);
     text_layer_set_text_color(s_load_back_layer, COLOR_TEXT_SEL);
     layer_set_frame(s_load_highlight_layer, GRect(mid_x - 32, 110, 64, 28));
     for (int i = 0; i < 3; i++) {
@@ -403,6 +438,7 @@ static void refresh_load_list(void) {
   } else {
     layer_set_hidden(text_layer_get_layer(s_load_empty_layer), true);
     layer_set_hidden(text_layer_get_layer(s_load_back_layer), true);
+    layer_set_hidden(text_layer_get_layer(s_load_hint_layer), false);
 
     int start = (s_load_selected_idx / 3) * 3;
     for (int i = 0; i < 3; i++) {
@@ -420,9 +456,24 @@ static void refresh_load_list(void) {
       }
     }
     int offset = s_load_selected_idx % 3;
-    layer_set_frame(s_load_highlight_layer, GRect(mid_x - 66, 48 + (offset * 32), 132, 28));
+    layer_set_frame(s_load_highlight_layer, GRect(mid_x - 66, 44 + (offset * 30), 132, 26));
   }
   layer_mark_dirty(s_load_highlight_layer);
+}
+
+static void update_delete_highlight(void) {
+  GRect win_bounds = layer_get_bounds(window_get_root_layer(s_main_window));
+  int mid_x = win_bounds.size.w / 2;
+
+  text_layer_set_text_color(s_del_opt1_layer, (s_del_menu_idx == 0) ? COLOR_TEXT_SEL : COLOR_TEXT_MAIN);
+  text_layer_set_text_color(s_del_opt2_layer, (s_del_menu_idx == 1) ? COLOR_TEXT_SEL : COLOR_TEXT_MAIN);
+
+  if (s_del_menu_idx == 0) {
+    layer_set_frame(s_del_highlight_layer, GRect(mid_x - 60, 84, 120, 26));
+  } else {
+    layer_set_frame(s_del_highlight_layer, GRect(mid_x - 50, 118, 100, 26));
+  }
+  layer_mark_dirty(s_del_highlight_layer);
 }
 
 static void update_count_highlight(void) {
@@ -527,12 +578,12 @@ static void update_timer_display(void) {
 static void timer_callback(void *data) {
   if (s_seconds_remaining > 0) {
     s_seconds_remaining--;
-    s_anim_frame = (s_anim_frame + 1) % 4; // Advance monkey animation frame
+    s_anim_frame = (s_anim_frame + 1) % 4;
     update_timer_display();
     s_sprint_timer = app_timer_register(1000, timer_callback, NULL);
   } else {
     s_sprint_timer = NULL;
-    vibes_enqueue_custom_pattern(s_triple_vibe);
+    vibes_enqueue_custom_pattern(s_sprint_end_vibes);
     set_app_state(APP_STATE_FINISHED);
   }
 }
@@ -586,10 +637,19 @@ static void set_app_state(AppState new_state) {
   if (!show_load) {
     layer_set_hidden(text_layer_get_layer(s_load_empty_layer), true);
     layer_set_hidden(text_layer_get_layer(s_load_back_layer), true);
+    layer_set_hidden(text_layer_get_layer(s_load_hint_layer), true);
     for (int i = 0; i < 3; i++) {
       layer_set_hidden(text_layer_get_layer(s_load_items_layers[i]), true);
     }
   }
+
+  // Delete Confirmation Screen
+  bool show_del = (s_app_state == APP_STATE_CONFIRM_DELETE);
+  layer_set_hidden(text_layer_get_layer(s_del_title_layer), !show_del);
+  layer_set_hidden(text_layer_get_layer(s_del_target_layer), !show_del);
+  layer_set_hidden(text_layer_get_layer(s_del_opt1_layer), !show_del);
+  layer_set_hidden(text_layer_get_layer(s_del_opt2_layer), !show_del);
+  layer_set_hidden(s_del_highlight_layer, !show_del);
 
   // Word Count
   bool show_count = (s_app_state == APP_STATE_INPUT_COUNT || s_app_state == APP_STATE_INPUT_END_COUNT);
@@ -667,6 +727,14 @@ static void set_app_state(AppState new_state) {
   } else if (s_app_state == APP_STATE_LOAD_LIST) {
     s_load_selected_idx = 0;
     refresh_load_list();
+  } else if (s_app_state == APP_STATE_CONFIRM_DELETE) {
+    if (s_del_target_idx >= 0 && s_del_target_idx < s_num_projects) {
+      static char target_buf[32];
+      snprintf(target_buf, sizeof(target_buf), "\"%s\"", s_projects[s_del_target_idx].name);
+      text_layer_set_text(s_del_target_layer, target_buf);
+    }
+    s_del_menu_idx = 1; // Default cursor on Cancel
+    update_delete_highlight();
   } else if (s_app_state == APP_STATE_INPUT_COUNT) {
     text_layer_set_text(s_count_title_layer, "START WORD COUNT");
     s_count_cursor = 0;
@@ -743,6 +811,9 @@ static void up_click_handler(ClickRecognizerRef recognizer, void *context) {
       s_load_selected_idx = (s_load_selected_idx - 1 + s_num_projects) % s_num_projects;
       refresh_load_list();
     }
+  } else if (s_app_state == APP_STATE_CONFIRM_DELETE) {
+    s_del_menu_idx = (s_del_menu_idx == 0) ? 1 : 0;
+    update_delete_highlight();
   } else if (s_app_state == APP_STATE_INPUT_COUNT || s_app_state == APP_STATE_INPUT_END_COUNT) {
     if (s_count_cursor < 6) {
       s_count_digits[s_count_cursor] = (s_count_digits[s_count_cursor] + 1) % 10;
@@ -788,6 +859,9 @@ static void down_click_handler(ClickRecognizerRef recognizer, void *context) {
       s_load_selected_idx = (s_load_selected_idx + 1) % s_num_projects;
       refresh_load_list();
     }
+  } else if (s_app_state == APP_STATE_CONFIRM_DELETE) {
+    s_del_menu_idx = (s_del_menu_idx == 1) ? 0 : 1;
+    update_delete_highlight();
   } else if (s_app_state == APP_STATE_INPUT_COUNT || s_app_state == APP_STATE_INPUT_END_COUNT) {
     if (s_count_cursor < 6) {
       s_count_digits[s_count_cursor] = (s_count_digits[s_count_cursor] - 1 + 10) % 10;
@@ -814,7 +888,7 @@ static void down_click_handler(ClickRecognizerRef recognizer, void *context) {
   }
 }
 
-// SELECT BUTTON (Middle)
+// SELECT BUTTON (Middle Single Click)
 static void select_click_handler(ClickRecognizerRef recognizer, void *context) {
   if (s_app_state == APP_STATE_SPLASH) {
     if (s_splash_timer) {
@@ -903,6 +977,15 @@ static void select_click_handler(ClickRecognizerRef recognizer, void *context) {
       s_navigated_from_load = true;
       set_app_state(APP_STATE_CONFIRM_MENU);
     }
+  } else if (s_app_state == APP_STATE_CONFIRM_DELETE) {
+    if (s_del_menu_idx == 0) {
+      // Confirmed deletion
+      execute_delete_project(s_del_target_idx);
+      set_app_state(APP_STATE_LOAD_LIST);
+    } else {
+      // Cancelled
+      set_app_state(APP_STATE_LOAD_LIST);
+    }
   } else if (s_app_state == APP_STATE_INPUT_COUNT) {
     if (s_count_cursor < 6) {
       s_count_cursor++;
@@ -957,6 +1040,14 @@ static void select_click_handler(ClickRecognizerRef recognizer, void *context) {
   }
 }
 
+// SELECT BUTTON (Long Click - Opens Confirmation Dialog)
+static void select_long_click_handler(ClickRecognizerRef recognizer, void *context) {
+  if (s_app_state == APP_STATE_LOAD_LIST && s_num_projects > 0) {
+    s_del_target_idx = s_load_selected_idx;
+    set_app_state(APP_STATE_CONFIRM_DELETE);
+  }
+}
+
 // BACK BUTTON (Left)
 static void back_click_handler(ClickRecognizerRef recognizer, void *context) {
   if (s_app_state == APP_STATE_SPLASH) {
@@ -981,6 +1072,8 @@ static void back_click_handler(ClickRecognizerRef recognizer, void *context) {
     }
   } else if (s_app_state == APP_STATE_LOAD_LIST) {
     set_app_state(APP_STATE_PROJECT_HUB);
+  } else if (s_app_state == APP_STATE_CONFIRM_DELETE) {
+    set_app_state(APP_STATE_LOAD_LIST);
   } else if (s_app_state == APP_STATE_INPUT_COUNT) {
     if (s_count_cursor > 0) {
       s_count_cursor--;
@@ -1037,6 +1130,7 @@ static void click_config_provider(void *context) {
   window_single_click_subscribe(BUTTON_ID_UP, up_click_handler);
   window_single_click_subscribe(BUTTON_ID_DOWN, down_click_handler);
   window_single_click_subscribe(BUTTON_ID_SELECT, select_click_handler);
+  window_long_click_subscribe(BUTTON_ID_SELECT, 700, select_long_click_handler, NULL);
   window_single_click_subscribe(BUTTON_ID_BACK, back_click_handler);
 }
 
@@ -1095,18 +1189,22 @@ static void main_window_load(Window *window) {
   layer_add_child(window_layer, text_layer_get_layer(s_name_amend_layer));
 
   // ================= 3. LOAD EXISTING =================
-  s_load_title_layer = create_themed_text_layer(GRect(0, 12, bounds.size.w, 26), FONT_KEY_GOTHIC_18_BOLD, GTextAlignmentCenter);
+  s_load_title_layer = create_themed_text_layer(GRect(0, 10, bounds.size.w, 24), FONT_KEY_GOTHIC_18_BOLD, GTextAlignmentCenter);
   text_layer_set_text(s_load_title_layer, "SELECT PROJECT");
   layer_add_child(window_layer, text_layer_get_layer(s_load_title_layer));
 
-  s_load_highlight_layer = layer_create(GRect(mid_x - 66, 48, 132, 28));
+  s_load_highlight_layer = layer_create(GRect(mid_x - 66, 44, 132, 26));
   layer_set_update_proc(s_load_highlight_layer, box_draw_proc);
   layer_add_child(window_layer, s_load_highlight_layer);
 
   for (int i = 0; i < 3; i++) {
-    s_load_items_layers[i] = create_themed_text_layer(GRect(0, 50 + (i * 32), bounds.size.w, 26), FONT_KEY_GOTHIC_18_BOLD, GTextAlignmentCenter);
+    s_load_items_layers[i] = create_themed_text_layer(GRect(0, 44 + (i * 30), bounds.size.w, 26), FONT_KEY_GOTHIC_18_BOLD, GTextAlignmentCenter);
     layer_add_child(window_layer, text_layer_get_layer(s_load_items_layers[i]));
   }
+
+  s_load_hint_layer = create_themed_text_layer(GRect(0, 142, bounds.size.w, 18), FONT_KEY_GOTHIC_14, GTextAlignmentCenter);
+  text_layer_set_text(s_load_hint_layer, "Hold select to delete");
+  layer_add_child(window_layer, text_layer_get_layer(s_load_hint_layer));
 
   s_load_empty_layer = create_themed_text_layer(GRect(0, 50, bounds.size.w, 44), FONT_KEY_GOTHIC_18_BOLD, GTextAlignmentCenter);
   text_layer_set_text(s_load_empty_layer, "Nothing to\nsee here!");
@@ -1115,6 +1213,26 @@ static void main_window_load(Window *window) {
   s_load_back_layer = create_themed_text_layer(GRect(0, 112, bounds.size.w, 24), FONT_KEY_GOTHIC_18_BOLD, GTextAlignmentCenter);
   text_layer_set_text(s_load_back_layer, "Back");
   layer_add_child(window_layer, text_layer_get_layer(s_load_back_layer));
+
+  // ================= 3b. DELETE CONFIRMATION SCREEN =================
+  s_del_title_layer = create_themed_text_layer(GRect(0, 10, bounds.size.w, 24), FONT_KEY_GOTHIC_18_BOLD, GTextAlignmentCenter);
+  text_layer_set_text(s_del_title_layer, "DELETE PROJECT?");
+  layer_add_child(window_layer, text_layer_get_layer(s_del_title_layer));
+
+  s_del_target_layer = create_themed_text_layer(GRect(0, 42, bounds.size.w, 28), FONT_KEY_GOTHIC_18_BOLD, GTextAlignmentCenter);
+  layer_add_child(window_layer, text_layer_get_layer(s_del_target_layer));
+
+  s_del_highlight_layer = layer_create(GRect(mid_x - 50, 118, 100, 26));
+  layer_set_update_proc(s_del_highlight_layer, box_draw_proc);
+  layer_add_child(window_layer, s_del_highlight_layer);
+
+  s_del_opt1_layer = create_themed_text_layer(GRect(0, 84, bounds.size.w, 26), FONT_KEY_GOTHIC_18_BOLD, GTextAlignmentCenter);
+  text_layer_set_text(s_del_opt1_layer, "Yes, Delete");
+  layer_add_child(window_layer, text_layer_get_layer(s_del_opt1_layer));
+
+  s_del_opt2_layer = create_themed_text_layer(GRect(0, 118, bounds.size.w, 26), FONT_KEY_GOTHIC_18_BOLD, GTextAlignmentCenter);
+  text_layer_set_text(s_del_opt2_layer, "Cancel");
+  layer_add_child(window_layer, text_layer_get_layer(s_del_opt2_layer));
 
   // ================= 4. WORD COUNT SCREEN =================
   s_count_title_layer = create_themed_text_layer(GRect(0, 15, bounds.size.w, 26), FONT_KEY_GOTHIC_18_BOLD, GTextAlignmentCenter);
@@ -1193,12 +1311,10 @@ static void main_window_load(Window *window) {
   layer_add_child(window_layer, text_layer_get_layer(s_time_amend_layer));
 
   // ================= 7 & 8. WRITING / FINISHED SCREEN =================
-  // Monkey side-profile animation canvas (top half)
   s_monkey_anim_layer = layer_create(GRect(0, 10, bounds.size.w, 62));
   layer_set_update_proc(s_monkey_anim_layer, monkey_anim_update_proc);
   layer_add_child(window_layer, s_monkey_anim_layer);
 
-  // Sprint status text (bottom half)
   s_writing_layer = create_themed_text_layer(GRect(0, 76, bounds.size.w, 88), FONT_KEY_GOTHIC_18_BOLD, GTextAlignmentCenter);
   layer_add_child(window_layer, text_layer_get_layer(s_writing_layer));
 
@@ -1254,9 +1370,16 @@ static void main_window_unload(Window *window) {
   for (int i = 0; i < 3; i++) {
     text_layer_destroy(s_load_items_layers[i]);
   }
+  text_layer_destroy(s_load_hint_layer);
   text_layer_destroy(s_load_empty_layer);
   text_layer_destroy(s_load_back_layer);
   layer_destroy(s_load_highlight_layer);
+
+  text_layer_destroy(s_del_title_layer);
+  text_layer_destroy(s_del_target_layer);
+  text_layer_destroy(s_del_opt1_layer);
+  text_layer_destroy(s_del_opt2_layer);
+  layer_destroy(s_del_highlight_layer);
 
   text_layer_destroy(s_count_title_layer);
   for (int i = 0; i < 6; i++) {
